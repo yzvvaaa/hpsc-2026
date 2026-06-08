@@ -2,148 +2,193 @@
 #include <typeinfo>
 #include <random>
 #include <stdint.h>
+#include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <mma.h>
 #include <chrono>
 using namespace std;
 using namespace nvcuda;
 
-// Default configurations (highly optimized values for H100)
+// ---- Tunables (override at compile time with -DBLOCK_TILE_K=64 etc.) ----
 #ifndef BLOCK_TILE_M
 #define BLOCK_TILE_M 128
 #endif
-
 #ifndef BLOCK_TILE_N
 #define BLOCK_TILE_N 128
 #endif
-
 #ifndef BLOCK_TILE_K
-#define BLOCK_TILE_K 64
+#define BLOCK_TILE_K 32      // 32 keeps register pressure low; try 64 once verified
 #endif
-
 #ifndef WARP_TILE_M
 #define WARP_TILE_M 64
 #endif
-
 #ifndef WARP_TILE_N
 #define WARP_TILE_N 64
 #endif
-
 #ifndef BLOCK_SIZE
 #define BLOCK_SIZE 128
 #endif
-
 #ifndef SMEM_PADDING
 #define SMEM_PADDING 16
 #endif
 
+// Each thread computes a WARP_TILE_M x WARP_TILE_N output region (in 16x16 wmma tiles).
+// SMEM is DOUBLE BUFFERED so the next K-tile can be loaded while the current one computes.
+//
+// SMEM layouts:
+//   A: [BLOCK_TILE_K][BLOCK_TILE_M + PAD]  (K-major)  -> matrix_a col_major
+//   B: [BLOCK_TILE_N][BLOCK_TILE_K + PAD]  (N-major)  -> matrix_b col_major
+// The B layout is the key change vs. the [K][N] starter: the 4 contiguous-in-K values
+// read from column-major global B now land contiguously in SMEM, so the store is a
+// vectorized half2 (no scalar stores, no bank conflicts).
+
 __global__ __launch_bounds__(BLOCK_SIZE)
 void kernel(int dim_m, int dim_n, int dim_k, const float *d_a, const float *d_b, float *d_c) {
-  int tid = threadIdx.x;
-  int warp_id = threadIdx.x / 32;
+  const int tid = threadIdx.x;
+  const int warp_id = tid / 32;
+
+  constexpr int sizeA = BLOCK_TILE_K * (BLOCK_TILE_M + SMEM_PADDING);  // halfs per A buffer
+  constexpr int sizeB = BLOCK_TILE_N * (BLOCK_TILE_K + SMEM_PADDING);  // halfs per B buffer
 
   extern __shared__ half smem[];
-  int size_a = BLOCK_TILE_K * (BLOCK_TILE_M + SMEM_PADDING);
-  
-  half* smem_A = smem;
-  half* smem_B = smem + size_a;
+  half* smem_A = smem;                 // 2 buffers, stride sizeA
+  half* smem_B = smem + 2 * sizeA;     // 2 buffers, stride sizeB
 
-  // A warp computes a WARP_TILE_M x WARP_TILE_N sub-block of C (which is wmma tiles).
+  // ---- Accumulators (live in registers for the whole K loop) ----
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[WARP_TILE_M / 16][WARP_TILE_N / 16];
   #pragma unroll
   for (int r = 0; r < WARP_TILE_M / 16; r++)
+    #pragma unroll
     for (int c = 0; c < WARP_TILE_N / 16; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
 
   const int warps_per_col = BLOCK_TILE_N / WARP_TILE_N;
-  int warp_row = warp_id / warps_per_col;
-  int warp_col = warp_id % warps_per_col;
+  const int warp_row = warp_id / warps_per_col;
+  const int warp_col = warp_id % warps_per_col;
 
-  // Global load step constants
-  const int steps_a = (BLOCK_TILE_K * BLOCK_TILE_M) / (4 * BLOCK_SIZE);
-  const int num_cols_vec_a = BLOCK_TILE_M / 4;
-  const int steps_b = (BLOCK_TILE_K * BLOCK_TILE_N) / (4 * BLOCK_SIZE);
-  const int num_cols_vec_b = BLOCK_TILE_K / 4;
+  // ---- Global -> SMEM load descriptors ----
+  constexpr int steps_a = (BLOCK_TILE_K * BLOCK_TILE_M) / (4 * BLOCK_SIZE);
+  constexpr int num_cols_vec_a = BLOCK_TILE_M / 4;
+  constexpr int steps_b = (BLOCK_TILE_K * BLOCK_TILE_N) / (4 * BLOCK_SIZE);
+  constexpr int num_cols_vec_b = BLOCK_TILE_K / 4;   // vectorize along K
 
-  int offset_a_m = BLOCK_TILE_M * blockIdx.x;
-  int offset_b_n = BLOCK_TILE_N * blockIdx.y;
+  const int offset_a_m = BLOCK_TILE_M * blockIdx.x;
+  const int offset_b_n = BLOCK_TILE_N * blockIdx.y;
 
-  for (int k = 0; k < dim_k; k += BLOCK_TILE_K) {
-    // Load A tile into SMEM using vectorized half2 conversion
-    #pragma unroll
-    for (int step = 0; step < steps_a; ++step) {
-      int idx = step * BLOCK_SIZE + tid;
-      int j = idx / num_cols_vec_a;
-      int m = (idx % num_cols_vec_a) * 4;
-      float4 val = *reinterpret_cast<const float4*>(&d_a[(k + j) * dim_m + offset_a_m + m]);
-      half2 h_xy = __float22half2_rn(make_float2(val.x, val.y));
-      half2 h_zw = __float22half2_rn(make_float2(val.z, val.w));
-      *reinterpret_cast<half2*>(&smem_A[j * (BLOCK_TILE_M + SMEM_PADDING) + m + 0]) = h_xy;
-      *reinterpret_cast<half2*>(&smem_A[j * (BLOCK_TILE_M + SMEM_PADDING) + m + 2]) = h_zw;
+  // Register staging for the prefetched tile (kept as half to halve register pressure)
+  half2 rA[steps_a * 2];
+  half2 rB[steps_b * 2];
+
+  // ===== PROLOGUE: load tile @ k=0 directly into buffer 0 =====
+  #pragma unroll
+  for (int step = 0; step < steps_a; ++step) {
+    int idx = step * BLOCK_SIZE + tid;
+    int j = idx / num_cols_vec_a;
+    int m = (idx % num_cols_vec_a) * 4;
+    float4 v = *reinterpret_cast<const float4*>(&d_a[(0 + j) * dim_m + offset_a_m + m]);
+    *reinterpret_cast<half2*>(&smem_A[j * (BLOCK_TILE_M + SMEM_PADDING) + m + 0]) = __float22half2_rn(make_float2(v.x, v.y));
+    *reinterpret_cast<half2*>(&smem_A[j * (BLOCK_TILE_M + SMEM_PADDING) + m + 2]) = __float22half2_rn(make_float2(v.z, v.w));
+  }
+  #pragma unroll
+  for (int step = 0; step < steps_b; ++step) {
+    int idx = step * BLOCK_SIZE + tid;
+    int n = idx / num_cols_vec_b;
+    int kk = (idx % num_cols_vec_b) * 4;
+    float4 v = *reinterpret_cast<const float4*>(&d_b[(offset_b_n + n) * dim_k + 0 + kk]);
+    *reinterpret_cast<half2*>(&smem_B[n * (BLOCK_TILE_K + SMEM_PADDING) + kk + 0]) = __float22half2_rn(make_float2(v.x, v.y));
+    *reinterpret_cast<half2*>(&smem_B[n * (BLOCK_TILE_K + SMEM_PADDING) + kk + 2]) = __float22half2_rn(make_float2(v.z, v.w));
+  }
+  __syncthreads();
+
+  int read_buf = 0;
+  for (int k_tile = 0; k_tile < dim_k; k_tile += BLOCK_TILE_K) {
+    const int next = k_tile + BLOCK_TILE_K;
+    const int write_buf = read_buf ^ 1;
+    const bool has_next = (next < dim_k);
+
+    // ---- 1) Prefetch NEXT tile from global into registers (latency overlaps compute) ----
+    if (has_next) {
+      #pragma unroll
+      for (int step = 0; step < steps_a; ++step) {
+        int idx = step * BLOCK_SIZE + tid;
+        int j = idx / num_cols_vec_a;
+        int m = (idx % num_cols_vec_a) * 4;
+        float4 v = *reinterpret_cast<const float4*>(&d_a[(next + j) * dim_m + offset_a_m + m]);
+        rA[step * 2 + 0] = __float22half2_rn(make_float2(v.x, v.y));
+        rA[step * 2 + 1] = __float22half2_rn(make_float2(v.z, v.w));
+      }
+      #pragma unroll
+      for (int step = 0; step < steps_b; ++step) {
+        int idx = step * BLOCK_SIZE + tid;
+        int n = idx / num_cols_vec_b;
+        int kk = (idx % num_cols_vec_b) * 4;
+        float4 v = *reinterpret_cast<const float4*>(&d_b[(offset_b_n + n) * dim_k + next + kk]);
+        rB[step * 2 + 0] = __float22half2_rn(make_float2(v.x, v.y));
+        rB[step * 2 + 1] = __float22half2_rn(make_float2(v.z, v.w));
+      }
     }
 
-    // Load B tile into SMEM using vectorized half2 conversion
-    #pragma unroll
-    for (int step = 0; step < steps_b; ++step) {
-      int idx = step * BLOCK_SIZE + tid;
-      int n = idx / num_cols_vec_b;
-      int j = (idx % num_cols_vec_b) * 4;
-      float4 val = *reinterpret_cast<const float4*>(&d_b[(offset_b_n + n) * dim_k + k + j]);
-      
-      // B is loaded such that columns of the block map to rows in memory? 
-      // wait, d_b is col-major or row-major?
-      // B is col-major. d_b[n * dim_k + k + j]. We read 4 contiguous elements along K dimension.
-      // We store it into smem_B such that we can use wmma::row_major load later?
-      // Wait, in previous code:
-      // smem_B[(j + 0) * (BLOCK_TILE_N + SMEM_PADDING) + n] = val.x;
-      // This means we CANNOT use vectorized half2 store because the memory addresses are NOT contiguous!
-      // (j+0), (j+1) are different rows in SMEM!
-      // So we must store them separately.
-      smem_B[(j + 0) * (BLOCK_TILE_N + SMEM_PADDING) + n] = __float2half(val.x);
-      smem_B[(j + 1) * (BLOCK_TILE_N + SMEM_PADDING) + n] = __float2half(val.y);
-      smem_B[(j + 2) * (BLOCK_TILE_N + SMEM_PADDING) + n] = __float2half(val.z);
-      smem_B[(j + 3) * (BLOCK_TILE_N + SMEM_PADDING) + n] = __float2half(val.w);
-    }
-
-    __syncthreads();
-
+    // ---- 2) Compute on the current (read_buf) tile ----
+    half* A_buf = smem_A + read_buf * sizeA;
+    half* B_buf = smem_B + read_buf * sizeB;
     #pragma unroll
     for (int k_step = 0; k_step < BLOCK_TILE_K / 16; ++k_step) {
       wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag[WARP_TILE_N / 16];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag[WARP_TILE_N / 16];
 
-      // Load all B fragments for this k_step
       #pragma unroll
       for (int c = 0; c < WARP_TILE_N / 16; ++c) {
-        int col_idx = warp_col * WARP_TILE_N + c * 16;
-        wmma::load_matrix_sync(b_frag[c], &smem_B[k_step * 16 * (BLOCK_TILE_N + SMEM_PADDING) + col_idx], BLOCK_TILE_N + SMEM_PADDING);
+        int col_idx = warp_col * WARP_TILE_N + c * 16;   // n start
+        wmma::load_matrix_sync(b_frag[c],
+            &B_buf[col_idx * (BLOCK_TILE_K + SMEM_PADDING) + k_step * 16],
+            BLOCK_TILE_K + SMEM_PADDING);
       }
-
-      // Load one A fragment at a time and multiply with all B fragments
       #pragma unroll
       for (int r = 0; r < WARP_TILE_M / 16; ++r) {
-        int row_idx = warp_row * WARP_TILE_M + r * 16;
-        wmma::load_matrix_sync(a_frag, &smem_A[k_step * 16 * (BLOCK_TILE_M + SMEM_PADDING) + row_idx], BLOCK_TILE_M + SMEM_PADDING);
-        
+        int row_idx = warp_row * WARP_TILE_M + r * 16;   // m start
+        wmma::load_matrix_sync(a_frag,
+            &A_buf[k_step * 16 * (BLOCK_TILE_M + SMEM_PADDING) + row_idx],
+            BLOCK_TILE_M + SMEM_PADDING);
         #pragma unroll
-        for (int c = 0; c < WARP_TILE_N / 16; ++c) {
+        for (int c = 0; c < WARP_TILE_N / 16; ++c)
           wmma::mma_sync(acc[r][c], a_frag, b_frag[c], acc[r][c]);
-        }
       }
     }
-    __syncthreads();
+
+    // ---- 3) Commit the prefetched registers into the OTHER (write_buf) buffer ----
+    if (has_next) {
+      half* A_wb = smem_A + write_buf * sizeA;
+      half* B_wb = smem_B + write_buf * sizeB;
+      #pragma unroll
+      for (int step = 0; step < steps_a; ++step) {
+        int idx = step * BLOCK_SIZE + tid;
+        int j = idx / num_cols_vec_a;
+        int m = (idx % num_cols_vec_a) * 4;
+        *reinterpret_cast<half2*>(&A_wb[j * (BLOCK_TILE_M + SMEM_PADDING) + m + 0]) = rA[step * 2 + 0];
+        *reinterpret_cast<half2*>(&A_wb[j * (BLOCK_TILE_M + SMEM_PADDING) + m + 2]) = rA[step * 2 + 1];
+      }
+      #pragma unroll
+      for (int step = 0; step < steps_b; ++step) {
+        int idx = step * BLOCK_SIZE + tid;
+        int n = idx / num_cols_vec_b;
+        int kk = (idx % num_cols_vec_b) * 4;
+        *reinterpret_cast<half2*>(&B_wb[n * (BLOCK_TILE_K + SMEM_PADDING) + kk + 0]) = rB[step * 2 + 0];
+        *reinterpret_cast<half2*>(&B_wb[n * (BLOCK_TILE_K + SMEM_PADDING) + kk + 2]) = rB[step * 2 + 1];
+      }
+      __syncthreads();
+      read_buf = write_buf;
+    }
   }
 
-  // Write back to global memory C
+  // ---- Write back to C (column-major, ldc = dim_m) ----
   #pragma unroll
   for (int r = 0; r < WARP_TILE_M / 16; r++) {
     #pragma unroll
     for (int c = 0; c < WARP_TILE_N / 16; c++) {
       int c_m = offset_a_m + warp_row * WARP_TILE_M + r * 16;
       int c_n = offset_b_n + warp_col * WARP_TILE_N + c * 16;
-      if (c_n < dim_n && c_m < dim_m) {
+      if (c_n < dim_n && c_m < dim_m)
         wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
-      }
     }
   }
 }
@@ -196,8 +241,8 @@ int main(int argc, const char **argv) {
 
   dim3 block = dim3(BLOCK_SIZE);
   dim3 grid = dim3((m+BLOCK_TILE_M-1)/BLOCK_TILE_M, (n+BLOCK_TILE_N-1)/BLOCK_TILE_N);
-  int smem_size = (BLOCK_TILE_K * (BLOCK_TILE_M + SMEM_PADDING) + 
-                   BLOCK_TILE_K * (BLOCK_TILE_N + SMEM_PADDING)) * sizeof(half);
+  int smem_size = (2 * BLOCK_TILE_K * (BLOCK_TILE_M + SMEM_PADDING) +
+                   2 * BLOCK_TILE_N * (BLOCK_TILE_K + SMEM_PADDING)) * sizeof(half);
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
   for (int i = 0; i < Nt+2; i++) {
